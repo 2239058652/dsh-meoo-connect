@@ -1,0 +1,25 @@
+# 端到端验证：不依赖插件写入，直接把 meoo 路由配给 llm-pi-ai，
+# 证明「pi-ai + meoo 网关 + MEOO_API_KEY」这条链路本身可用。
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      meoo:
+        apiKeyEnv: MEOO_API_KEY
+        displayName: Meoo 秒悟
+        api: openai-completions
+        baseURL: https://api.meoo.host/meoo-ai/compatible-mode/v1
+        models:
+          - id: qwen3.8-flash
+            name: Qwen3.8-Flash
+            contextWindow: 200000
+            maxTokens: 64000
+          - id: deepseek-v4-pro-0813
+            name: DeepSeek V4 Pro
+            contextWindow: 200000
+            maxTokens: 64000
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: meoo
+    model: qwen3.8-flash

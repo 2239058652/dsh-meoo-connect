@@ -1,0 +1,8 @@
+# dsh-meoo-connect bundle patch.
+#
+# 一行 insert 即挂载 Host 半身。路由注册（llm-pi-ai 的 meoo 提供方）由
+# index.js 在 apply 时写入，不需要额外的浏览器半身。
+- insert:
+    - id: meoo
+      name: 'dsh-meoo-connect'
+      config: {}

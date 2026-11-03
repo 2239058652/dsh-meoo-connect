@@ -1,0 +1,10 @@
+# 端到端验证用的 overlay：把 dsh-meoo-connect 挂进 headless profile，并把默认模型指到 meoo 路由
+- insert:
+    - id: meoo
+      name: dsh-meoo-connect
+      config: {}
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: meoo
+    model: qwen3.8-flash

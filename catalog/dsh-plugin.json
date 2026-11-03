@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Yan-Zero/dsh-std/3df054302468d2091859db4b3bd079042d33f100/packages/manifest/schema/dsh-plugin-0.15.schema.json",
+  "manifestVersion": "0.15",
+  "id": "io.github.2239058652.dsh-meoo-connect",
+  "name": "dsh-meoo-connect",
+  "version": "1.0.1",
+  "description": "把秒悟 Meoo 的模型接进 dsh：自动登录取项目服务 AK、同步模型目录，模型直接出现在会话模型选择器与「设置 → 模型」里",
+  "facets": {
+    "host": {
+      "entry": "index.js",
+      "apiVersion": "v1alpha1"
+    }
+  },
+  "license": "MIT",
+  "source": {
+    "repository": "https://github.com/2239058652/dsh-meoo-connect",
+    "revision": "c079f5cd778fa87f050015813630201fd1a38e6c"
+  }
+}

@@ -1,0 +1,6 @@
+# 只改默认模型，meoo 路由必须来自 profile patch（模拟插件写入后的状态）
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: meoo
+    model: qwen3.8-flash
