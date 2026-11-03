@@ -26,8 +26,8 @@ import { spawn } from 'node:child_process'
 
 export const name = 'meoo'
 
-/** 需要 settings 才能写路由；其余服务（credentials / commands）都是可选的。 */
-export const inject = ['llm']
+/** 需要 settings 才能写路由；其余服务（credentials / commands / llm）都是可选的。 */
+export const inject = ['settings']
 
 const DEFAULT_API_BASE = 'https://meoo.com'
 const DEFAULT_GATEWAY = 'https://api.meoo.host/meoo-ai/compatible-mode/v1'
@@ -100,9 +100,12 @@ function clientIdFor(apiBaseUrl) {
 
 function openBrowser(url) {
   try {
+    // Windows 上不能走 `cmd /c start`：cmd 会把 URL 里的 `&` 当成命令分隔符，
+    // 浏览器只拿到 `?client_id=...` 这一段（缺 response_type），授权页报
+    // unsupported_response_type。explorer.exe 直接收参数，不经 shell 解析。
     const child =
       process.platform === 'win32'
-        ? spawn('cmd', ['/c', 'start', '""', url], { detached: true, stdio: 'ignore', windowsHide: true })
+        ? spawn('explorer.exe', [url], { detached: true, stdio: 'ignore', windowsHide: true })
         : process.platform === 'darwin'
           ? spawn('open', [url], { detached: true, stdio: 'ignore' })
           : spawn('xdg-open', [url], { detached: true, stdio: 'ignore' })
@@ -280,7 +283,11 @@ export function startLogin(state) {
   })
 
   let redirectUri = ''
-  const ready = new Promise((resolve) => {
+  const ready = new Promise((resolve, reject) => {
+    server.on('error', (err) => {
+      settle.reject(err)
+      reject(err)
+    })
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address()
       redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
@@ -298,6 +305,11 @@ export function startLogin(state) {
 
   const timeout = setTimeout(() => settle.reject(new Error('浏览器授权等待超时（5 分钟）')), 5 * 60 * 1000)
   timeout.unref?.()
+  // listen 失败（端口被占、权限不足）时立刻收拾，不再白等 5 分钟
+  ready.catch(() => {
+    clearTimeout(timeout)
+    server.close()
+  })
   // 无论成功、失败还是超时都要关掉回调端口，否则每试一次登录就残留一个监听。
   done.finally(() => {
     clearTimeout(timeout)
@@ -311,7 +323,7 @@ export function startLogin(state) {
 // 控制面：账号 / 项目 / 项目服务 AK / 网关目录
 // ---------------------------------------------------------------------------
 
-async function controlRequest(state, method, apiPath, body) {
+async function controlRequest(state, method, apiPath, body, retried = false) {
   const token = await ensureAccessToken(state)
   const res = await fetch(`${state.apiBaseUrl}${apiPath}`, {
     method,
@@ -332,9 +344,13 @@ async function controlRequest(state, method, apiPath, body) {
   } catch {
     json = null
   }
-  if (res.status === 401 && state.refreshToken) {
+  // 刷新后仍 401 就不再重试，否则会无限打接口
+  if (res.status === 401 && state.refreshToken && !retried) {
     await refreshAccessToken(state)
-    return controlRequest(state, method, apiPath, body)
+    return controlRequest(state, method, apiPath, body, true)
+  }
+  if (res.status === 401) {
+    throw new Error(`${apiPath} 失败 HTTP 401（刷新后仍 401，请重新 /meoo login）: ${json?.detail || json?.message || text.slice(0, 160)}`)
   }
   if (!res.ok) {
     throw new Error(`${apiPath} 失败 HTTP ${res.status}: ${json?.detail || json?.message || text.slice(0, 160)}`)
@@ -346,7 +362,8 @@ async function fetchIdentity(state) {
   const me = await controlRequest(state, 'GET', '/open/v1/cli-compat/account/identity')
   state.username = me?.name || state.username
   state.userId = me?.user_id || state.userId
-  state.projectUrlId = me?.project_url_id || state.projectUrlId
+  // 已有项目（比如 /meoo project 显式指定）时不要用服务端默认值覆盖
+  if (!state.projectUrlId) state.projectUrlId = me?.project_url_id || state.projectUrlId
   saveState(state)
   return me
 }
@@ -356,9 +373,27 @@ async function listProjects(state, limit = 50) {
   return data?.list || data?.items || data?.projects || (Array.isArray(data) ? data : [])
 }
 
+/**
+ * 选中一个项目。`identity` 的 `project_url_id` 常常是 null（账号没设默认项目），
+ * 这时按项目列表自己挑：只有一个就用它，多个则报错并列出可选 urlId。
+ * @returns 项目的 url_id。
+ */
+async function pickProject(state, explicitUrlId) {
+  if (explicitUrlId) return explicitUrlId
+  if (state.projectUrlId) return state.projectUrlId
+  const projects = await listProjects(state)
+  if (!projects.length) throw new Error('账号下还没有项目：先在 meoo.com 建一个项目')
+  if (projects.length === 1) {
+    const only = projects[0]?.url_id || projects[0]?.urlId
+    if (!only) throw new Error('项目列表里没有 url_id，无法定位项目')
+    return only
+  }
+  const options = projects.map((p) => `${p.url_id || p.urlId}（${p.name || '未命名'}）`).join('\n  ')
+  throw new Error(`账号下有多个项目，请用 /meoo project <urlId> 指定一个：\n  ${options}`)
+}
+
 async function resolveServiceAk(state, { projectUrlId, force = false } = {}) {
-  const urlId = projectUrlId || state.projectUrlId
-  if (!urlId) throw new Error('还没有项目：先用 /meoo project <urlId> 指定一个')
+  const urlId = await pickProject(state, projectUrlId)
   if (!force && state.serviceAk && state.serviceAkProjectId === urlId) return state.serviceAk
 
   let env = null
@@ -446,13 +481,9 @@ async function storeCredential(ctx, ak, { overwrite }) {
   }
   if (!credentials) return { ok: false, reason: 'no-credentials-service' }
   try {
-    let ref = DEFAULT_API_KEY_ENV
-    try {
-      const mod = await import('@deepseek-ai/dsh-credentials')
-      if (typeof mod.credentialRef === 'function') ref = mod.credentialRef(DEFAULT_API_KEY_ENV)
-    } catch {
-      /* 用裸字符串 */
-    }
+    // 品牌类型 CredentialRef 只是编译期标记，运行期就是字符串；
+    // 本包不声明 @deepseek-ai/* 依赖，故不走 credentialRef()
+    const ref = DEFAULT_API_KEY_ENV
     if (!overwrite) {
       const info = await credentials.describe?.(ref)
       if (info?.configured) return { ok: true, skipped: true }
@@ -498,18 +529,32 @@ async function writeProfile(settings, profile, route, { overwrite }) {
   if (existing && !overwrite) {
     // 已经配过：只补空缺字段，绝不覆盖用户在「设置 → 模型」里改过的值
     const patch = {}
-    if (!existing.models?.length) patch.models = profile.models
     if (!existing.baseURL) patch.baseURL = profile.baseURL
     if (!existing.api) patch.api = profile.api
     if (!existing.apiKeyEnv) patch.apiKeyEnv = profile.apiKeyEnv
     if (!existing.displayName) patch.displayName = profile.displayName
-    if (!Object.keys(patch).length) return { updated: false, reason: 'already-configured' }
+
+    // 模型按 id 求差集：已有的原样保留（不碰 reasoningEfforts / input / compat），
+    // 网关新增的追加到末尾，网关已下线的保留不删。mergeLayers 对数组是整体替换，
+    // 所以这里必须传完整数组。
+    const existingModels = Array.isArray(existing.models) ? existing.models : []
+    const existingIds = new Set(existingModels.map((m) => m.id))
+    const added = profile.models.filter((m) => !existingIds.has(m.id))
+    if (!existingModels.length) {
+      patch.models = profile.models
+    } else if (added.length) {
+      patch.models = [...existingModels, ...added]
+    }
+
+    if (!Object.keys(patch).length) {
+      return { updated: false, reason: 'already-configured', addedModels: 0, keptModels: existingModels.length }
+    }
     await settings.update(PI_AI_NS, { providers: { [route]: patch } })
-    return { updated: true }
+    return { updated: true, addedModels: added.length, keptModels: existingModels.length }
   }
 
   await settings.update(PI_AI_NS, { providers: { [route]: profile } })
-  return { created: true }
+  return { created: true, addedModels: profile.models.length, keptModels: 0 }
 }
 
 /**
@@ -572,7 +617,7 @@ export async function syncOnce(ctx, state, { overwrite = false, force = false, p
       diag.piAiProviders = readProviders(settings) === undefined ? 'namespace-missing' : 'present'
       const described = settings.describe?.({ redactSecrets: true })
       diag.describeRaw = JSON.stringify(described)?.slice(0, 600)
-      const llm = ctx.get?.('llm')
+      const llm = ctx.get?.('llm', false)
       diag.hasLlm = Boolean(llm)
       diag.configurable = llm?.listConfigurableProviders?.()?.map((e) => `${e.provider}@${e.settingsNs}`) ?? 'n/a'
       diag.liveProviders = llm?.listProviders?.()?.map((p) => p.id) ?? 'n/a'
@@ -655,17 +700,25 @@ function registerCommand(ctx, state, logger) {
 
           case 'sync': {
             const result = await syncOnce(ctx, state, { force: true })
+            const written = result.written || {}
+            const addedModels = Number(written.addedModels) || 0
+            const keptModels = Number(written.keptModels) || 0
             return {
               kind: result.ok ? 'success' : 'error',
               text: result.ok
-                ? `已同步 ${result.models} 个模型到 \`llm-pi-ai\` 提供方 \`${result.route}\`（项目 ${result.projectUrlId}）。\n在输入框的模型选择器里选「${DEFAULT_PROVIDER_NAME}」即可使用。`
+                ? `已同步（新增 ${addedModels} 个模型，保留 ${keptModels} 个已有配置）到 \`llm-pi-ai\` 提供方 \`${result.route}\`（项目 ${result.projectUrlId}）。\n在输入框的模型选择器里选「${DEFAULT_PROVIDER_NAME}」即可使用。`
                 : result.message || '同步失败',
             }
           }
 
           case 'login': {
             const { ready, done } = startLogin(state)
-            const url = await ready
+            let url
+            try {
+              url = await ready
+            } catch (err) {
+              return { kind: 'error', text: `启动本机授权回调失败: ${err?.message || err}` }
+            }
             openBrowser(url)
             done
               .then(async () => {
@@ -674,7 +727,10 @@ function registerCommand(ctx, state, logger) {
                   await syncOnce(ctx, state, { force: true })
                   logger.info?.('dsh-meoo: 同步完成')
                 } catch (err) {
-                  logger.warn?.(`dsh-meoo: 同步失败 ${err?.message || err}`)
+                  // 写进 state，否则 /meoo status 只显示「未同步」，用户看不到原因
+                  state.lastError = err?.message || String(err)
+                  saveState(state)
+                  logger.warn?.(`dsh-meoo: 同步失败 ${state.lastError}`)
                 }
               })
               .catch((err) => logger.warn?.(`dsh-meoo: 授权失败 ${err?.message || err}`))
@@ -756,14 +812,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['settings'], (scoped) => {
-      scoped.effect?.(() => () => {}, 'dsh-meoo: sync')
-      defer(() => boot(scoped))
-    })
-  } else {
-    defer(() => boot(ctx))
-  }
+  defer(() => boot(ctx))
 }
 
 export const __internals = {

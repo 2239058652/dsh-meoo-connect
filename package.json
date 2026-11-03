@@ -33,7 +33,7 @@
   "author": "2239058652",
   "license": "MIT",
   "engines": {
-    "node": ">=20",
+    "node": ">=22.19.0",
     "dsh": ">=0.2.1-rc.5 <0.3.0"
   },
   "scripts": {
